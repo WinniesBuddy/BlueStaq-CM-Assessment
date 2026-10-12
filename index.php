@@ -659,18 +659,7 @@ final class NotesApi
             apiError(404, 'not_found', 'The requested resource was not found.');
         }
 
-        if ($ifMatch !== null) {
-            $expected = $this->expectedVersion($ifMatch);
-            if ($expected !== null && $expected !== (int)$current['version']) {
-                apiError(
-                    412,
-                    'precondition_failed',
-                    'The note changed since version ' . $expected . '.'
-                );
-            }
-        } else {
-            $expected = null;
-        }
+        $expected = $ifMatch === null ? null : $this->expectedVersion($ifMatch);
 
         $updates = [];
         if ($title !== null) {

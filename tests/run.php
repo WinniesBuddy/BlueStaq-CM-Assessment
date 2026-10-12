@@ -455,7 +455,7 @@ try {
     $archivedNotes = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?archived=1", $ownerToken);
     assertTrue(count($archivedNotes['items']) === 1, 'archived=1 should list archived notes.');
 
-    expectResponse(
+    $betaVersionOne = expectResponse(
         $api,
         'PATCH',
         "/teams/$featureTeamId/notes/{$beta['id']}",
@@ -463,7 +463,9 @@ try {
         (object)['title' => 'Beta v2'],
         200,
         (string)$beta['version']
-    );
+    )['note'];
+    assertTrue($betaVersionOne['version'] === 2, 'A successful If-Match write should bump the version.');
+
     expectResponse(
         $api,
         'PATCH',
@@ -473,7 +475,18 @@ try {
         412,
         (string)$beta['version']
     );
-    expectResponse(
+    $betaAfterStale = expectResponse(
+        $api,
+        'GET',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken
+    )['note'];
+    assertTrue(
+        $betaAfterStale['title'] === 'Beta v2' && $betaAfterStale['version'] === 2,
+        'A rejected stale write must not mutate the note.'
+    );
+
+    $betaVersionThree = expectResponse(
         $api,
         'PATCH',
         "/teams/$featureTeamId/notes/{$beta['id']}",
@@ -481,6 +494,37 @@ try {
         (object)['title' => 'wildcard write'],
         200,
         '*'
+    )['note'];
+    assertTrue($betaVersionThree['version'] === 3, 'A wildcard If-Match should always succeed.');
+
+    $betaVersionFour = expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['title' => 'quoted write'],
+        200,
+        '"' . $betaVersionThree['version'] . '"'
+    )['note'];
+    assertTrue($betaVersionFour['version'] === 4, 'A quoted ETag If-Match value should be accepted.');
+
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['title' => 'bad precondition'],
+        expectedStatus: 400,
+        ifMatch: 'not-a-version'
+    );
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/999999",
+        $ownerToken,
+        (object)['title' => 'missing'],
+        expectedStatus: 404,
+        ifMatch: '1'
     );
 
     expectResponse($api, 'GET', "/teams/$featureTeamId/notes?limit=0", $ownerToken, expectedStatus: 400);
