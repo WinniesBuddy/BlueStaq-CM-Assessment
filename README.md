@@ -12,14 +12,15 @@ From the repository directory:
 php -S 127.0.0.1:8000 index.php
 ```
 
-The service creates `notes.db` in the repository directory. Configure the
-listener and database with environment variables:
+The service creates `notes.db` in the repository directory. The PHP built-in
+server reads `HOST` and `PORT` through the `php -S` command below; the service
+itself reads only the database path from `NOTES_DB`:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Listen address |
-| `PORT` | `8000` | Listen port |
-| `NOTES_DB` | `notes.db` | SQLite database file |
+| `HOST` | `127.0.0.1` | Listen address (used by `php -S`) |
+| `PORT` | `8000` | Listen port (used by `php -S`) |
+| `NOTES_DB` | `notes.db` | SQLite database file (read by the service) |
 
 PowerShell example:
 
@@ -121,8 +122,8 @@ to opt out) and expect `412` when the version is stale.
 | `cursor` | previous `next_cursor` | Continue the listing |
 
 Team names are limited to 100 characters, note titles to 200, note content to
-100,000, and request bodies to 1 MiB. An empty note body is allowed and note
-content whitespace is preserved. All team members can create, edit, and delete
+100,000, and request bodies to 1 MiB. The `content` field must be present but
+may be an empty string, and note content whitespace is preserved. All team members can create, edit, and delete
 all notes in their team. Team membership is required to read notes; team admins
 additionally manage membership. A team must always retain at least one admin.
 Unknown teams and notes outside the caller's teams return `404` to avoid
