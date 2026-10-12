@@ -113,6 +113,15 @@ Three decisions took the most time and shaped the rest of the service:
    authorization ordering — validate input, then decide who may act, without
    leaking other teams' existence — and into accepting the tradeoff that all
    members of a team share the same read/write privileges on its notes.
+
+   *How "shared" is scoped.* The brief calls this a service "shared amongst
+   several small teams"; that is interpreted as the service being multi-tenant,
+   not notes crossing team boundaries. Keeping every team's notes private to
+   that team avoids one team's conventions, edits, or naming leaking into
+   another's and the confusion that would follow. Cross-team sharing is
+   therefore intentionally out of scope; if it were added, it would be an
+   explicit, opt-in grant (for example a per-note visibility field or a
+   team-to-team share) rather than an implicit capability.
 2. **SQLite with WAL and a zero-dependency HTTP entry point.** A small shared
    service wants single-file, predictable setup; SQLite foreign keys,
    transactions, an index on `(team_id, updated_at)`, and WAL mode keep the
