@@ -904,9 +904,9 @@ final class NotesApi
                             'DELETE FROM memberships WHERE team_id = ? AND user_id = ?',
                             [$teamId, $memberId]
                         );
-                        $this->db->commit();
+                        $this->db->exec('COMMIT');
                     } catch (Throwable $exception) {
-                        $this->db->rollBack();
+                        $this->db->exec('ROLLBACK');
                         throw $exception;
                     }
                     return [204, null];
