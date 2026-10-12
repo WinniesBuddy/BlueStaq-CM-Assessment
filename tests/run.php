@@ -100,8 +100,12 @@ try {
     $memberId = $member['user']['id'];
 
     expectResponse($api, 'GET', '/me', expectedStatus: 401);
-    $me = expectResponse($api, 'GET', '/me', $ownerToken);
-    assertTrue($me['user']['email'] === 'owner@example.test', '/me did not return the owner.');
+    $meLower = expectResponse($api, 'GET', '/me', $ownerToken);
+    assertTrue($meLower['user']['email'] === 'owner@example.test', '/me did not return the owner for canonical bearer tokens.');
+    [$statusLower, $meMixed] = $api->handle('GET', '/me', 'bearer ' . $ownerToken);
+    assertTrue($statusLower === 200 && $meMixed['user']['email'] === 'owner@example.test', '/me did not accept lowercase bearer scheme.');
+    [$statusUpper, $meUpper] = $api->handle('GET', '/me', 'BEARER ' . $ownerToken);
+    assertTrue($statusUpper === 200 && $meUpper['user']['email'] === 'owner@example.test', '/me did not accept uppercase bearer scheme.');
 
     expectResponse(
         $api,

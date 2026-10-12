@@ -360,11 +360,11 @@ final class NotesApi
 
     private function authenticate(?string $authorization): array
     {
-        if ($authorization === null || !str_starts_with($authorization, 'Bearer ')) {
+        if ($authorization === null || !preg_match('/^Bearer\s+/i', $authorization)) {
             apiError(401, 'unauthorized', 'A valid bearer token is required.');
         }
-        $token = substr($authorization, 7);
-        if ($token === '') {
+        $token = preg_replace('/^Bearer\s+/i', '', $authorization);
+        if ($token === null || $token === '') {
             apiError(401, 'unauthorized', 'A valid bearer token is required.');
         }
         $row = $this->statement(
