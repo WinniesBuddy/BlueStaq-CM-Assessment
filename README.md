@@ -40,6 +40,11 @@ Run the dependency-free PHP API tests with:
 php tests/run.php
 ```
 
+The single suite exercises the routing, authentication, authorization, notes,
+tags, search, pagination, archive/pin, and optimistic-concurrency behaviour, the
+transport-layer body decoding (`415`/`413`/invalid JSON), and the legacy-schema
+migration and search-index backfill.
+
 ## API
 
 All request and response bodies are JSON (except empty `204` responses). Send

@@ -20,6 +20,28 @@ function apiError(int $status, string $code, string $message): never
     throw new ApiException($status, $code, $message);
 }
 
+function decodeRequestBody(?string $contentType, ?string $contentLength, callable $readBody): mixed
+{
+    $lengthHeader = $contentLength ?? '0';
+    if (!ctype_digit($lengthHeader)) {
+        apiError(400, 'invalid_content_length', 'Content-Length must be an integer.');
+    }
+    if ((int)$lengthHeader > MAX_REQUEST_BYTES) {
+        apiError(413, 'request_too_large', 'Request body exceeds 1 MiB.');
+    }
+    if ((int)$lengthHeader === 0) {
+        return null;
+    }
+    if (strtolower(trim(explode(';', $contentType ?? '')[0])) !== 'application/json') {
+        apiError(415, 'unsupported_media_type', 'Content-Type must be application/json.');
+    }
+    try {
+        return json_decode($readBody(), flags: JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        apiError(400, 'invalid_json', 'Request body must contain valid JSON.');
+    }
+}
+
 final class NotesApi
 {
     private PDO $db;
@@ -969,25 +991,11 @@ function emitResponse(int $status, mixed $payload): never
 
 if (PHP_SAPI === 'cli-server') {
     try {
-        $lengthHeader = $_SERVER['CONTENT_LENGTH'] ?? '0';
-        if (!ctype_digit((string)$lengthHeader)) {
-            apiError(400, 'invalid_content_length', 'Content-Length must be an integer.');
-        }
-        $length = (int)$lengthHeader;
-        if ($length > MAX_REQUEST_BYTES) {
-            apiError(413, 'request_too_large', 'Request body exceeds 1 MiB.');
-        }
-        $body = null;
-        if ($length > 0) {
-            if (strtolower(trim(explode(';', requestHeader('Content-Type') ?? '')[0])) !== 'application/json') {
-                apiError(415, 'unsupported_media_type', 'Content-Type must be application/json.');
-            }
-            try {
-                $body = json_decode(file_get_contents('php://input'), flags: JSON_THROW_ON_ERROR);
-            } catch (JsonException) {
-                apiError(400, 'invalid_json', 'Request body must contain valid JSON.');
-            }
-        }
+        $body = decodeRequestBody(
+            requestHeader('Content-Type'),
+            $_SERVER['CONTENT_LENGTH'] ?? null,
+            static fn(): string => (string)file_get_contents('php://input')
+        );
         $databasePath = getenv('NOTES_DB') ?: __DIR__ . DIRECTORY_SEPARATOR . 'notes.db';
         $api = new NotesApi($databasePath);
         [$status, $payload] = $api->handle(
