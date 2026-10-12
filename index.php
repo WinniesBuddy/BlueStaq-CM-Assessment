@@ -117,13 +117,18 @@ final class NotesApi
         if (!is_string($value)) {
             apiError(400, 'invalid_field', "$field must be a string.");
         }
+        if (preg_match('//u', $value) !== 1) {
+            apiError(400, 'invalid_field', "$field must contain only valid UTF-8 text.");
+        }
         if ($strip) {
             $value = trim($value);
         }
         $length = preg_match_all('/./us', $value);
-        if ((!$allowEmpty && $length === 0) || $length > $maximum) {
-            $empty = $allowEmpty ? 'empty or ' : '';
-            apiError(400, 'invalid_field', "$field must be $empty"."at most $maximum characters.");
+        if ($length > $maximum) {
+            apiError(400, 'invalid_field', "$field must be at most $maximum characters.");
+        }
+        if ($length === 0 && !$allowEmpty) {
+            apiError(400, 'invalid_field', "$field must not be empty.");
         }
         return $value;
     }

@@ -82,7 +82,8 @@ Unknown teams and notes outside the caller's teams return `404` to avoid
 disclosing their existence. Common status codes are `201` for creation, `204`
 for successful deletion/logout, `400` for invalid input, `401` for
 missing/invalid credentials, `403` for an insufficient team role, `404` for an
-inaccessible or absent resource, and `409` for a conflict.
+inaccessible or absent resource, `409` for a conflict, `413` for an oversized
+body, and `415` for an unsupported content type.
 
 Example:
 
@@ -101,36 +102,56 @@ Invoke-RestMethod -Method Post `
 
 ## Design choices
 
-1. **Team-scoped data and explicit membership.** Notes belong to a team rather
-   than an individual, so sharing and isolation are enforced at the same
-   boundary. Membership is checked on each team and note request, and team
-   admins alone can add or remove members. To keep the initial service easy to
-   operate, an admin can add an account after it has registered; there is no
-   invitation-email workflow.
-2. **SQLite and a dependency-free PHP HTTP entry point.** A small team service
-   benefits from a single-file database and straightforward local setup. SQLite
-   foreign keys, transactions, and indexes keep the data model consistent,
-   while PDO and PHP's built-in development server avoid a Composer dependency
-   chain. The built-in server is for local development, not high availability
-   or heavy concurrent workloads.
-3. **Opaque, revocable sessions and bounded inputs.** Passwords are stored with
-   PHP's `password_hash` and verified with `password_verify` (the password is
-   SHA-384 pre-hashed to safely support the documented length with bcrypt-based
-   PHP defaults); clients receive random tokens whose SHA-256 digests are stored
-   server-side, so logout can revoke credentials without storing raw tokens.
-   Request and field limits provide a basic resource boundary, and
-   authorization failures do not reveal whether a different team's data exists.
+Three decisions took the most time and shaped the rest of the service:
+
+1. **Teams own the data; membership is the access boundary.** Notes live under a
+   team rather than a user, so sharing and isolation are enforced in the same
+   place: every team or note request checks the caller's membership, and absent
+   or inaccessible resources both return `404` so requests never reveal whether
+   another team's data exists. Admins alone add or remove members, and a team
+   must always keep at least one admin. Most of the time went into the
+   authorization ordering — validate input, then decide who may act, without
+   leaking other teams' existence — and into accepting the tradeoff that all
+   members of a team share the same read/write privileges on its notes.
+2. **SQLite with WAL and a zero-dependency HTTP entry point.** A small shared
+   service wants single-file, predictable setup; SQLite foreign keys,
+   transactions, an index on `(team_id, updated_at)`, and WAL mode keep the
+   model consistent without a database server to run. The tradeoff is a single
+   primary: the service targets one instance, and concurrent writers or
+   horizontal scale are a deliberate follow-up rather than a silent assumption.
+   PHP's built-in server is only the local-development runtime and is explicitly
+   documented as needing a real web server and TLS in front of it.
+3. **Opaque, revocable bearer sessions and bounded inputs.** Clients receive
+   random tokens whose SHA-256 digests are stored server-side, so logout is a
+   real revocation and raw credentials are never at rest. Passwords use
+   `password_hash`/`password_verify` over a pre-hash that safely covers the
+   documented 8-256-character range under bcrypt's byte limits. Requests are
+   capped at 1 MiB before parsing, field lengths are counted as Unicode
+   characters, and stored values are validated as UTF-8 so every note can always
+   be re-encoded without loss. Simple, all-or-nothing limits are easier to
+   explain, test, and defend than elaborate streaming rules.
 
 ## If I had more time
 
-- Replace the built-in server with a maintained production PHP framework and
-  web-server configuration, and add TLS, rate limiting, and health checks.
-- Add verified-email invitations, password reset/change, session listing and
-  revocation, and account lifecycle controls.
-- Add note revision history or optimistic concurrency (ETags) to make
-  simultaneous editing safer, plus pagination for large teams.
-- Add migration/version management, backup/restore procedures, and broader
-  concurrency, expiry, and malformed-request tests.
-- Revisit SQLite if usage requires multiple service instances or sustained
-  concurrent writes; move to a managed relational database with appropriate
-  migrations and deployment monitoring.
+**Add.** Verified-email invitations, password reset/change, session listing and
+revocation, and account lifecycle controls (deletion, ownership transfer). Note
+revision history or optimistic concurrency (ETags) so simultaneous editors do
+not silently overwrite each other, plus cursor pagination and full-text
+search for large teams. Brute-force protection on login, rate limiting,
+health checks, structured logging, and explicit migration/backup/restore
+procedures.
+
+**Change.** Replace PHP's built-in development server and the hand-rolled router
+with a maintained framework and a real web-server/TLS configuration, letting the
+framework own request parsing, routing, and validation instead of the custom
+glue here (content-length and content-type checks, body decoding). Move to a
+managed relational database if the service needs multiple instances or
+sustained concurrent writes, and revisit the fixed request and field limits as
+usage grows.
+
+**Stop doing.** Hand-maintaining web-server glue that a framework or managed
+runtime provides; storing large note bodies inline in the notes table once long
+or attached content appears; and treating SQLite's single writer as an
+acceptable default — it is only acceptable because the intended scope is one
+small team service, and it would be the first constraint re-examined if the
+scope grew.
