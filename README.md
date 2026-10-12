@@ -30,6 +30,15 @@ $env:NOTES_DB = "data\team-notes.sqlite3"
 php -S "$($env:HOST):$($env:PORT)" index.php
 ```
 
+POSIX shells (bash/zsh):
+
+```bash
+export HOST=127.0.0.1
+export PORT=8080
+export NOTES_DB=data/team-notes.sqlite3
+php -S "$HOST:$PORT" index.php
+```
+
 The built-in PHP server is intended for local development. Put the service
 behind a properly configured production web server and TLS-terminating proxy
 before exposing it to a network.
@@ -137,6 +146,24 @@ Invoke-RestMethod -Method Post `
   -Uri "http://127.0.0.1:8000/teams/$($team.team.id)/notes" `
   -Headers $headers -ContentType "application/json" `
   -Body '{"title":"Next steps","content":"Agree on the milestones","tags":["planning"]}'
+```
+
+The same flow with `curl` and `php` doing the JSON parsing (so no `jq` is
+required):
+
+```bash
+BASE=http://127.0.0.1:8000
+TOKEN=$(curl -s -X POST "$BASE/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alex@example.com","password":"a-long-enough-password"}' \
+  | php -r 'echo json_decode(file_get_contents("php://stdin"))->token;')
+TEAM=$(curl -s -X POST "$BASE/teams" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Planning"}' \
+  | php -r 'echo json_decode(file_get_contents("php://stdin"))->team->id;')
+curl -s -X POST "$BASE/teams/$TEAM/notes" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Next steps","content":"Agree on the milestones","tags":["planning"]}'
 ```
 
 ## Design choices
