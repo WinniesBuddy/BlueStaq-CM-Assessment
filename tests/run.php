@@ -9,14 +9,16 @@ function expectResponse(
     string $path,
     ?string $token = null,
     mixed $body = null,
-    int $expectedStatus = 200
+    int $expectedStatus = 200,
+    ?string $ifMatch = null
 ): mixed {
     try {
         [$status, $payload] = $api->handle(
             $method,
             $path,
             $token === null ? null : 'Bearer ' . $token,
-            $body
+            $body,
+            $ifMatch
         );
     } catch (ApiException $exception) {
         $status = $exception->status;
@@ -341,6 +343,187 @@ try {
     foreach ($memberTeams as $row) {
         assertTrue($row['id'] !== $teamId, 'Removed member was still listed for the team.');
     }
+
+    $featureTeam = expectResponse(
+        $api,
+        'POST',
+        '/teams',
+        $ownerToken,
+        (object)['name' => 'Features'],
+        201
+    )['team'];
+    $featureTeamId = $featureTeam['id'];
+
+    $tagged = expectResponse(
+        $api,
+        'POST',
+        "/teams/$featureTeamId/notes",
+        $ownerToken,
+        (object)[
+            'title' => 'Alpha',
+            'content' => 'the quick brown fox',
+            'tags' => ['Work', 'work', 'Urgent'],
+        ],
+        201
+    )['note'];
+    assertTrue($tagged['tags'] === ['urgent', 'work'], 'Tags were not normalized, deduplicated, and sorted.');
+    assertTrue($tagged['version'] === 1, 'New notes should start at version 1.');
+    assertTrue(
+        $tagged['archived'] === false && $tagged['pinned'] === false,
+        'Note flags should default to false.'
+    );
+
+    expectResponse(
+        $api,
+        'POST',
+        "/teams/$featureTeamId/notes",
+        $ownerToken,
+        (object)['title' => 'Beta', 'content' => 'lazy dog', 'tags' => ['home']],
+        201
+    );
+    $beta = expectResponse(
+        $api,
+        'POST',
+        "/teams/$featureTeamId/notes",
+        $ownerToken,
+        (object)['title' => 'Gamma', 'content' => 'fox and hound', 'tags' => ['work', 'home']],
+        201
+    )['note'];
+
+    $featureAll = expectResponse($api, 'GET', "/teams/$featureTeamId/notes", $ownerToken);
+    assertTrue(count($featureAll['items']) === 3, 'Expected the three feature notes to be listed.');
+    assertTrue($featureAll['next_cursor'] === null, 'An unpaginated listing should not return a cursor.');
+
+    $byTag = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?tag=work", $ownerToken);
+    assertTrue(count($byTag['items']) === 2, 'tag=work should match two notes.');
+    $byTagUpper = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?tag=HOME", $ownerToken);
+    assertTrue(count($byTagUpper['items']) === 2, 'Tag filtering should be case-insensitive.');
+
+    $search = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?q=fox", $ownerToken);
+    assertTrue(count($search['items']) === 2, 'Full-text search should match title and content.');
+
+    $titleSorted = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?sort=title", $ownerToken);
+    assertTrue(
+        array_column($titleSorted['items'], 'title') === ['Alpha', 'Beta', 'Gamma'],
+        'sort=title should order titles ascending.'
+    );
+
+    $page1 = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?limit=2", $ownerToken);
+    assertTrue(
+        count($page1['items']) === 2 && is_string($page1['next_cursor']),
+        'The first page should carry a cursor.'
+    );
+    $page2 = expectResponse(
+        $api,
+        'GET',
+        "/teams/$featureTeamId/notes?limit=2&cursor=" . rawurlencode($page1['next_cursor']),
+        $ownerToken
+    );
+    assertTrue(
+        count($page2['items']) === 1 && $page2['next_cursor'] === null,
+        'The second page should finish the listing without another cursor.'
+    );
+
+    $updated = expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$tagged['id']}",
+        $ownerToken,
+        (object)['tags' => ['solo'], 'pinned' => true],
+        200
+    )['note'];
+    assertTrue($updated['tags'] === ['solo'], 'PATCH should replace the whole tag set.');
+    assertTrue($updated['pinned'] === true, 'PATCH should set pinned.');
+    assertTrue($updated['version'] === 2, 'PATCH should increment the version.');
+
+    $pinned = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?pinned=1", $ownerToken);
+    assertTrue(
+        count($pinned['items']) === 1 && $pinned['items'][0]['id'] === $tagged['id'],
+        'pinned=1 should return only pinned notes.'
+    );
+
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$tagged['id']}",
+        $ownerToken,
+        (object)['archived' => true],
+        200
+    );
+    $activeNotes = expectResponse($api, 'GET', "/teams/$featureTeamId/notes", $ownerToken);
+    assertTrue(count($activeNotes['items']) === 2, 'Archived notes should be hidden from the default listing.');
+    $archivedNotes = expectResponse($api, 'GET', "/teams/$featureTeamId/notes?archived=1", $ownerToken);
+    assertTrue(count($archivedNotes['items']) === 1, 'archived=1 should list archived notes.');
+
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['title' => 'Beta v2'],
+        200,
+        (string)$beta['version']
+    );
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['title' => 'stale write'],
+        412,
+        (string)$beta['version']
+    );
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['title' => 'wildcard write'],
+        200,
+        '*'
+    );
+
+    expectResponse($api, 'GET', "/teams/$featureTeamId/notes?limit=0", $ownerToken, expectedStatus: 400);
+    expectResponse($api, 'GET', "/teams/$featureTeamId/notes?sort=bogus", $ownerToken, expectedStatus: 400);
+    expectResponse(
+        $api,
+        'GET',
+        "/teams/$featureTeamId/notes?cursor=not-a-cursor",
+        $ownerToken,
+        expectedStatus: 400
+    );
+    expectResponse($api, 'GET', "/teams/$featureTeamId/notes?archived=maybe", $ownerToken, expectedStatus: 400);
+    expectResponse(
+        $api,
+        'GET',
+        "/teams/$featureTeamId/notes?tag=" . str_repeat('x', 51),
+        $ownerToken,
+        expectedStatus: 400
+    );
+    expectResponse(
+        $api,
+        'PATCH',
+        "/teams/$featureTeamId/notes/{$beta['id']}",
+        $ownerToken,
+        (object)['archived' => 'yes'],
+        expectedStatus: 400
+    );
+    expectResponse(
+        $api,
+        'POST',
+        "/teams/$featureTeamId/notes",
+        $ownerToken,
+        (object)['title' => 'x', 'content' => '', 'tags' => 'nope'],
+        expectedStatus: 400
+    );
+    expectResponse(
+        $api,
+        'POST',
+        "/teams/$featureTeamId/notes",
+        $ownerToken,
+        (object)['title' => 'x', 'content' => '', 'tags' => array_fill(0, 21, 'tag')],
+        expectedStatus: 400
+    );
 
     $login = expectResponse(
         $api,

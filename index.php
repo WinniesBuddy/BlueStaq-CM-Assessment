@@ -81,15 +81,69 @@ final class NotesApi
                 author_id INTEGER NOT NULL REFERENCES users(id),
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+                pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
                 created_at TEXT NOT NULL DEFAULT
                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 updated_at TEXT NOT NULL DEFAULT
                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
+            CREATE TABLE IF NOT EXISTS note_tags (
+                note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (note_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS note_tags_tag ON note_tags(tag, note_id);
             CREATE INDEX IF NOT EXISTS notes_team_updated
                 ON notes(team_id, updated_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content);
+            CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
+                INSERT INTO notes_fts(rowid, title, content)
+                VALUES (new.id, new.title, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE ON notes BEGIN
+                UPDATE notes_fts SET title = new.title, content = new.content
+                WHERE rowid = new.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
+                DELETE FROM notes_fts WHERE rowid = old.id;
+            END;
             SQL);
+
+        $this->ensureNotesColumns();
+        $this->db->exec(
+            'CREATE INDEX IF NOT EXISTS notes_team_archived
+                ON notes(team_id, archived, updated_at DESC, id DESC)'
+        );
+        $this->populateSearchIndex();
+    }
+
+    private function ensureNotesColumns(): void
+    {
+        $columns = $this->db->query('PRAGMA table_info(notes)')->fetchAll(PDO::FETCH_COLUMN, 1);
+        $additions = [
+            'version' => 'ALTER TABLE notes ADD COLUMN version INTEGER NOT NULL DEFAULT 1',
+            'archived' => 'ALTER TABLE notes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0',
+            'pinned' => 'ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0',
+        ];
+        foreach ($additions as $column => $sql) {
+            if (!in_array($column, $columns, true)) {
+                $this->db->exec($sql);
+            }
+        }
+    }
+
+    private function populateSearchIndex(): void
+    {
+        $indexed = (int)$this->db->query('SELECT count(*) FROM notes_fts')->fetchColumn();
+        $notes = (int)$this->db->query('SELECT count(*) FROM notes')->fetchColumn();
+        if ($indexed === 0 && $notes > 0) {
+            $this->db->exec(
+                'INSERT INTO notes_fts(rowid, title, content) SELECT id, title, content FROM notes'
+            );
+        }
     }
 
     private function statement(string $sql, array $parameters = []): PDOStatement
@@ -146,7 +200,7 @@ final class NotesApi
         return ['id' => (int)$row['id'], 'email' => $row['email']];
     }
 
-    private function noteJson(array $row): array
+    private function noteJson(array $row, array $tags = []): array
     {
         return [
             'id' => (int)$row['id'],
@@ -154,9 +208,116 @@ final class NotesApi
             'author_id' => (int)$row['author_id'],
             'title' => $row['title'],
             'content' => $row['content'],
+            'tags' => $tags,
+            'version' => (int)$row['version'],
+            'archived' => (bool)$row['archived'],
+            'pinned' => (bool)$row['pinned'],
             'created_at' => $row['created_at'],
             'updated_at' => $row['updated_at'],
         ];
+    }
+
+    private function tags(mixed $value): array
+    {
+        if ($value === null) {
+            return [];
+        }
+        if (!is_array($value)) {
+            apiError(400, 'invalid_tags', 'tags must be an array of strings.');
+        }
+        if (count($value) > 20) {
+            apiError(400, 'invalid_tags', 'A note may have at most 20 tags.');
+        }
+        $normalized = [];
+        foreach ($value as $tag) {
+            $normalized[strtolower($this->text($tag, 'tag', 50))] = true;
+        }
+        return array_keys($normalized);
+    }
+
+    private function boolean(mixed $value, string $field): bool
+    {
+        if (!is_bool($value)) {
+            apiError(400, 'invalid_field', "$field must be a boolean.");
+        }
+        return $value;
+    }
+
+    private function tagsForNote(int $noteId): array
+    {
+        return $this->statement(
+            'SELECT tag FROM note_tags WHERE note_id = ? ORDER BY tag',
+            [$noteId]
+        )->fetchAll(PDO::FETCH_COLUMN);
+    }
+
+    private function tagsForNotes(array $noteIds): array
+    {
+        if ($noteIds === []) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($noteIds), '?'));
+        $rows = $this->statement(
+            "SELECT note_id, tag FROM note_tags WHERE note_id IN ($placeholders) ORDER BY tag",
+            $noteIds
+        )->fetchAll();
+        $map = [];
+        foreach ($rows as $row) {
+            $map[(int)$row['note_id']][] = $row['tag'];
+        }
+        return $map;
+    }
+
+    private function replaceTags(int $noteId, array $tags): void
+    {
+        $this->statement('DELETE FROM note_tags WHERE note_id = ?', [$noteId]);
+        foreach ($tags as $tag) {
+            $this->statement('INSERT INTO note_tags(note_id, tag) VALUES (?, ?)', [$noteId, $tag]);
+        }
+    }
+
+    private function matchQuery(string $search): string
+    {
+        return '"' . str_replace('"', '""', $search) . '"';
+    }
+
+    private function encodeCursor(string $sort, string $key, int $id): string
+    {
+        $payload = json_encode([$sort, $key, $id], JSON_THROW_ON_ERROR);
+        return rtrim(strtr(base64_encode($payload), '+/', '-_'), '=');
+    }
+
+    private function decodeCursor(string $cursor): array
+    {
+        $padded = strtr($cursor, '-_', '+/');
+        $padded .= str_repeat('=', (4 - strlen($padded) % 4) % 4);
+        $decoded = base64_decode($padded, true);
+        if ($decoded === false) {
+            apiError(400, 'invalid_cursor', 'The cursor is invalid.');
+        }
+        try {
+            $data = json_decode($decoded, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            apiError(400, 'invalid_cursor', 'The cursor is invalid.');
+        }
+        if (!is_array($data) || count($data) !== 3 || !is_string($data[0])
+            || !is_string($data[1]) || !is_int($data[2])) {
+            apiError(400, 'invalid_cursor', 'The cursor is invalid.');
+        }
+        return $data;
+    }
+
+    private function expectedVersion(string $ifMatch): ?int
+    {
+        $value = trim($ifMatch);
+        if ($value === '*') {
+            return null;
+        }
+        $value = trim($value, '"');
+        if ($value === '' || !ctype_digit($value)) {
+            apiError(400, 'invalid_if_match', 'If-Match must be a note version or *.');
+        }
+        return (int)$value;
     }
 
     private function passwordInput(string $password): string
@@ -281,11 +442,296 @@ final class NotesApi
         ]];
     }
 
+    private function listNotes(int $teamId, int $userId, array $query): array
+    {
+        $this->requireMember($teamId, $userId);
+
+        $archived = '0';
+        if (array_key_exists('archived', $query)) {
+            if (!is_string($query['archived']) || !in_array($query['archived'], ['0', '1'], true)) {
+                apiError(400, 'invalid_query', 'archived must be 0 or 1.');
+            }
+            $archived = $query['archived'];
+        }
+
+        $pinned = null;
+        if (array_key_exists('pinned', $query)) {
+            if (!is_string($query['pinned']) || !in_array($query['pinned'], ['0', '1'], true)) {
+                apiError(400, 'invalid_query', 'pinned must be 0 or 1.');
+            }
+            $pinned = (int)$query['pinned'];
+        }
+
+        $tag = null;
+        if (array_key_exists('tag', $query)) {
+            if (!is_string($query['tag'])) {
+                apiError(400, 'invalid_query', 'tag must be a single string.');
+            }
+            $tag = strtolower($this->text($query['tag'], 'tag', 50));
+        }
+
+        $search = null;
+        if (array_key_exists('q', $query)) {
+            if (!is_string($query['q'])) {
+                apiError(400, 'invalid_query', 'q must be a single string.');
+            }
+            $search = $this->text($query['q'], 'q', 200);
+        }
+
+        $sort = 'updated';
+        if (array_key_exists('sort', $query)) {
+            if (!is_string($query['sort'])
+                || !in_array($query['sort'], ['updated', 'created', 'title'], true)) {
+                apiError(400, 'invalid_query', 'sort must be updated, created, or title.');
+            }
+            $sort = $query['sort'];
+        }
+
+        $limit = 50;
+        if (array_key_exists('limit', $query)) {
+            if (!is_string($query['limit'])
+                || !ctype_digit($query['limit'])
+                || (int)$query['limit'] < 1
+                || (int)$query['limit'] > 100) {
+                apiError(400, 'invalid_query', 'limit must be an integer between 1 and 100.');
+            }
+            $limit = (int)$query['limit'];
+        }
+
+        $cursor = null;
+        if (array_key_exists('cursor', $query)) {
+            if (!is_string($query['cursor']) || $query['cursor'] === '') {
+                apiError(400, 'invalid_query', 'cursor must be a non-empty string.');
+            }
+            $cursor = $query['cursor'];
+        }
+
+        $joins = [];
+        $where = ['n.team_id = ?', 'n.archived = ?'];
+        $params = [$teamId, (int)$archived];
+
+        if ($pinned !== null) {
+            $where[] = 'n.pinned = ?';
+            $params[] = $pinned;
+        }
+        if ($tag !== null) {
+            $where[] = 'EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND nt.tag = ?)';
+            $params[] = $tag;
+        }
+        if ($search !== null) {
+            $joins[] = 'JOIN notes_fts ON notes_fts.rowid = n.id';
+            $where[] = 'notes_fts MATCH ?';
+            $params[] = $this->matchQuery($search);
+        }
+
+        switch ($sort) {
+            case 'created':
+                $order = 'n.created_at DESC, n.id DESC';
+                $keyField = 'created_at';
+                $ascending = false;
+                break;
+            case 'title':
+                $order = 'n.title ASC, n.id ASC';
+                $keyField = 'title';
+                $ascending = true;
+                break;
+            default:
+                $order = 'n.updated_at DESC, n.id DESC';
+                $keyField = 'updated_at';
+                $ascending = false;
+        }
+
+        if ($cursor !== null) {
+            [$cursorSort, $key, $cursorId] = $this->decodeCursor($cursor);
+            if ($cursorSort !== $sort) {
+                apiError(400, 'invalid_cursor', 'The cursor does not match the requested sort.');
+            }
+            $operator = $ascending ? '>' : '<';
+            $where[] = "(n.$keyField $operator ? OR (n.$keyField = ? AND n.id $operator ?))";
+            array_push($params, $key, $key, $cursorId);
+        }
+
+        $sql = 'SELECT n.* FROM notes n ' . implode(' ', $joins)
+            . ' WHERE ' . implode(' AND ', $where)
+            . ' ORDER BY ' . $order
+            . ' LIMIT ' . ($limit + 1);
+
+        $rows = $this->statement($sql, $params)->fetchAll();
+
+        $nextCursor = null;
+        if (count($rows) > $limit) {
+            array_pop($rows);
+            $last = $rows[count($rows) - 1];
+            $nextCursor = $this->encodeCursor($sort, (string)$last[$keyField], (int)$last['id']);
+        }
+
+        $tagMap = $this->tagsForNotes(array_map(
+            static fn(array $row): int => (int)$row['id'],
+            $rows
+        ));
+        $items = array_map(
+            fn(array $row): array => $this->noteJson($row, $tagMap[(int)$row['id']] ?? []),
+            $rows
+        );
+
+        return [200, ['items' => $items, 'next_cursor' => $nextCursor]];
+    }
+
+    private function createNote(int $teamId, int $userId, mixed $body): array
+    {
+        $data = $this->requireObject($body);
+        $title = $this->text($data->title ?? null, 'title', 200);
+        $content = $this->text(
+            $data->content ?? null,
+            'content',
+            100000,
+            allowEmpty: true,
+            strip: false
+        );
+        $tags = $this->tags($data->tags ?? null);
+
+        $this->requireMember($teamId, $userId);
+        $this->db->beginTransaction();
+        try {
+            $this->statement(
+                'INSERT INTO notes(team_id, author_id, title, content) VALUES (?, ?, ?, ?)',
+                [$teamId, $userId, $title, $content]
+            );
+            $noteId = (int)$this->db->lastInsertId();
+            $this->replaceTags($noteId, $tags);
+            $this->db->commit();
+        } catch (Throwable $exception) {
+            $this->db->rollBack();
+            throw $exception;
+        }
+
+        $note = $this->statement('SELECT * FROM notes WHERE id = ?', [$noteId])->fetch();
+        return [201, ['note' => $this->noteJson($note, $this->tagsForNote($noteId))]];
+    }
+
+    private function updateNote(
+        int $teamId,
+        int $noteId,
+        int $userId,
+        mixed $body,
+        ?string $ifMatch
+    ): array {
+        $data = $this->requireObject($body);
+        $fields = get_object_vars($data);
+        $allowed = ['title', 'content', 'tags', 'archived', 'pinned'];
+        if ($fields === [] || array_diff(array_keys($fields), $allowed) !== []) {
+            apiError(400, 'invalid_fields', 'Provide one or more of: title, content, tags, archived, pinned.');
+        }
+
+        $title = null;
+        $content = null;
+        $tags = null;
+        $archived = null;
+        $pinned = null;
+        if (array_key_exists('title', $fields)) {
+            $title = $this->text($fields['title'], 'title', 200);
+        }
+        if (array_key_exists('content', $fields)) {
+            $content = $this->text(
+                $fields['content'],
+                'content',
+                100000,
+                allowEmpty: true,
+                strip: false
+            );
+        }
+        if (array_key_exists('tags', $fields)) {
+            $tags = $this->tags($fields['tags']);
+        }
+        if (array_key_exists('archived', $fields)) {
+            $archived = $this->boolean($fields['archived'], 'archived');
+        }
+        if (array_key_exists('pinned', $fields)) {
+            $pinned = $this->boolean($fields['pinned'], 'pinned');
+        }
+
+        $this->requireMember($teamId, $userId);
+        $current = $this->statement(
+            'SELECT * FROM notes WHERE id = ? AND team_id = ?',
+            [$noteId, $teamId]
+        )->fetch();
+        if ($current === false) {
+            apiError(404, 'not_found', 'The requested resource was not found.');
+        }
+
+        if ($ifMatch !== null) {
+            $expected = $this->expectedVersion($ifMatch);
+            if ($expected !== null && $expected !== (int)$current['version']) {
+                apiError(
+                    412,
+                    'precondition_failed',
+                    'The note changed since version ' . $expected . '.'
+                );
+            }
+        } else {
+            $expected = null;
+        }
+
+        $updates = [];
+        if ($title !== null) {
+            $updates['title'] = $title;
+        }
+        if ($content !== null) {
+            $updates['content'] = $content;
+        }
+        if ($archived !== null) {
+            $updates['archived'] = $archived ? 1 : 0;
+        }
+        if ($pinned !== null) {
+            $updates['pinned'] = $pinned ? 1 : 0;
+        }
+
+        $this->db->beginTransaction();
+        try {
+            $assignments = implode(', ', array_map(
+                static fn(string $field): string => "$field = ?",
+                array_keys($updates)
+            ));
+            if ($assignments !== '') {
+                $assignments .= ', ';
+            }
+            $guard = $expected === null ? '' : ' AND version = ?';
+            $parameters = [...array_values($updates), $noteId, $teamId];
+            if ($expected !== null) {
+                $parameters[] = $expected;
+            }
+            $statement = $this->statement(
+                "UPDATE notes SET {$assignments}version = version + 1, "
+                . "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                . "WHERE id = ? AND team_id = ?{$guard}",
+                $parameters
+            );
+            if ($expected !== null && $statement->rowCount() === 0) {
+                apiError(
+                    412,
+                    'precondition_failed',
+                    'The note changed since version ' . $expected . '.'
+                );
+            }
+            if ($tags !== null) {
+                $this->replaceTags($noteId, $tags);
+            }
+            $this->db->commit();
+        } catch (Throwable $exception) {
+            $this->db->rollBack();
+            throw $exception;
+        }
+
+        $note = $this->statement('SELECT * FROM notes WHERE id = ?', [$noteId])->fetch();
+        return [200, ['note' => $this->noteJson($note, $this->tagsForNote($noteId))]];
+    }
+
     public function handle(
         string $method,
         string $path,
         ?string $authorization,
-        mixed $body = null
+        mixed $body = null,
+        ?string $ifMatch = null
     ): array {
         $pathOnly = parse_url($path, PHP_URL_PATH);
         $parts = array_values(array_filter(
@@ -293,6 +739,12 @@ final class NotesApi
             static fn(string $part): bool => $part !== ''
         ));
         $parts = array_map('rawurldecode', $parts);
+
+        $query = [];
+        $queryString = parse_url($path, PHP_URL_QUERY);
+        if (is_string($queryString)) {
+            parse_str($queryString, $query);
+        }
 
         if ($parts === ['auth', 'register'] && $method === 'POST') {
             return $this->register($body);
@@ -452,33 +904,10 @@ final class NotesApi
 
             if (count($parts) >= 3 && $parts[2] === 'notes') {
                 if (count($parts) === 3 && $method === 'GET') {
-                    $this->requireMember($teamId, $user['id']);
-                    $rows = $this->statement(
-                        'SELECT * FROM notes WHERE team_id = ? ORDER BY updated_at DESC, id DESC',
-                        [$teamId]
-                    )->fetchAll();
-                    return [200, ['items' => array_map($this->noteJson(...), $rows)]];
+                    return $this->listNotes($teamId, $user['id'], $query);
                 }
                 if (count($parts) === 3 && $method === 'POST') {
-                    $data = $this->requireObject($body);
-                    $title = $this->text($data->title ?? null, 'title', 200);
-                    $content = $this->text(
-                        $data->content ?? null,
-                        'content',
-                        100000,
-                        allowEmpty: true,
-                        strip: false
-                    );
-                    $this->requireMember($teamId, $user['id']);
-                    $this->statement(
-                        'INSERT INTO notes(team_id, author_id, title, content) VALUES (?, ?, ?, ?)',
-                        [$teamId, $user['id'], $title, $content]
-                    );
-                    $note = $this->statement(
-                        'SELECT * FROM notes WHERE id = ?',
-                        [(int)$this->db->lastInsertId()]
-                    )->fetch();
-                    return [201, ['note' => $this->noteJson($note)]];
+                    return $this->createNote($teamId, $user['id'], $body);
                 }
                 if (count($parts) === 4) {
                     $noteId = $this->id($parts[3]);
@@ -491,48 +920,10 @@ final class NotesApi
                         if ($note === false) {
                             apiError(404, 'not_found', 'The requested resource was not found.');
                         }
-                        return [200, ['note' => $this->noteJson($note)]];
+                        return [200, ['note' => $this->noteJson($note, $this->tagsForNote($noteId))]];
                     }
                     if ($method === 'PATCH') {
-                        $data = $this->requireObject($body);
-                        $fields = get_object_vars($data);
-                        if ($fields === [] || array_diff(array_keys($fields), ['title', 'content']) !== []) {
-                            apiError(400, 'invalid_fields', 'Provide title and/or content only.');
-                        }
-                        $updates = [];
-                        if (array_key_exists('title', $fields)) {
-                            $updates['title'] = $this->text($fields['title'], 'title', 200);
-                        }
-                        if (array_key_exists('content', $fields)) {
-                            $updates['content'] = $this->text(
-                                $fields['content'],
-                                'content',
-                                100000,
-                                allowEmpty: true,
-                                strip: false
-                            );
-                        }
-                        $this->requireMember($teamId, $user['id']);
-                        $exists = $this->statement(
-                            'SELECT id FROM notes WHERE id = ? AND team_id = ?',
-                            [$noteId, $teamId]
-                        )->fetch();
-                        if ($exists === false) {
-                            apiError(404, 'not_found', 'The requested resource was not found.');
-                        }
-                        $assignments = implode(', ', array_map(
-                            static fn(string $field): string => "$field = ?",
-                            array_keys($updates)
-                        ));
-                        $this->statement(
-                            "UPDATE notes SET $assignments, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND team_id = ?",
-                            [...array_values($updates), $noteId, $teamId]
-                        );
-                        $note = $this->statement(
-                            'SELECT * FROM notes WHERE id = ?',
-                            [$noteId]
-                        )->fetch();
-                        return [200, ['note' => $this->noteJson($note)]];
+                        return $this->updateNote($teamId, $noteId, $user['id'], $body, $ifMatch);
                     }
                     if ($method === 'DELETE') {
                         $this->requireMember($teamId, $user['id']);
@@ -614,7 +1005,8 @@ if (PHP_SAPI === 'cli-server') {
             $_SERVER['REQUEST_METHOD'] ?? 'GET',
             $_SERVER['REQUEST_URI'] ?? '/',
             requestHeader('Authorization'),
-            $body
+            $body,
+            requestHeader('If-Match')
         );
         emitResponse($status, $payload);
     } catch (ApiException $exception) {
